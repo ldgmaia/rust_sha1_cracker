@@ -33,14 +33,40 @@ You may need to restart your terminal or run `source $HOME/.cargo/env` to update
     cd rust_sha1_cracker
     ```
 
-### 3. Build the Project
+
+### 3. Initialize Cargo Project (if needed)
+If you see an error like `could not find Cargo.toml`, you need to initialize the project:
+
+```
+cargo init --bin .
+```
+
+Then, move your `main.rs` file into the new `src/` directory (if it is not already there):
+
+```
+mv main.rs src/
+```
+
+
+### 4. Add Required Dependencies
+Before building, add the required dependencies:
+
+```
+cargo add sha1
+cargo add hex
+cargo add num_cpus
+```
+
+### 5. Build the Project
 Run:
 ```
 cargo build --release
 ```
 The compiled binary will be in the `target/release/` directory.
 
-### 4. Run the Program
+
+
+### 6. Run the Program
 Run the program with:
 ```
 cargo run --release
@@ -50,7 +76,9 @@ Or, to run the compiled binary directly:
 ./target/release/rust_sha1_cracker
 ```
 
-### 5. (Optional) Passing Arguments
+
+
+### 7. (Optional) Passing Arguments
 If your program expects arguments (e.g., a hash to crack), run:
 ```
 cargo run --release -- <arguments>
