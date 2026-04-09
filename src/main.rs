@@ -1,132 +1,151 @@
-use sha1::{Digest, Sha1};
-use std::{
-    fs::write,
-    str,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    thread,
-    time::{Duration, Instant},
-};
+// CUDA-accelerated brute-force SHA1 cracker
+use cust::prelude::*;
+use std::error::Error;
+use hex;
+use std::time::Instant;
 
 const TARGET_HASH: &str = "3d3ce61821b97b65f249d219a062cae11395bd11";
 const MAX_LENGTH: usize = 6;
-const CHARSET: &[u8] =
-    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
+const UTF16LE_BYTES_PER_CHAR: usize = 2;
+const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+const BATCH_SIZE: usize = 1_048_576; // Larger batch for maximum GPU throughput (reduce if OOM)
 
-fn to_utf16le_bytes(s: &str) -> Vec<u8> {
-    s.encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect()
-}
-
-fn main() {
-    let target_hash = hex::decode(TARGET_HASH).expect("Invalid hex in TARGET_HASH");
-    let found = Arc::new(AtomicBool::new(false));
-    let tested = Arc::new(AtomicU64::new(0));
-
-    let num_threads = num_cpus::get();
-    println!("[*] Using {} threads", num_threads);
-
+fn main() -> Result<(), Box<dyn Error>> {
     let start_time = Instant::now();
+    cust::init(cust::CudaFlags::empty())?;
+    let device = Device::get_device(0)?;
+    let _ctx = Context::new(device)?;
+    let module = Module::from_file("sha1_kernel.ptx")?;
+    let func = module.get_function("sha1_kernel")?;
+    let target_hash = hex::decode(TARGET_HASH).expect("Invalid hex in TARGET_HASH");
 
-    let threads: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let found = Arc::clone(&found);
-            let tested = Arc::clone(&tested);
-            let target_hash = target_hash.clone();
+    let charset_len = CHARSET.len();
+    let total: u128 = charset_len.pow(MAX_LENGTH as u32) as u128;
+    let mut found = false;
+    let mut found_pwd = vec![];
 
-            thread::spawn(move || {
-                let mut pwd = vec![0u8; MAX_LENGTH];
-                let mut stack = vec![];
 
-                for i in (thread_id..CHARSET.len()).step_by(num_threads) {
-                    stack.push((0, i));
-                }
+    let input_bytes_per_pwd = MAX_LENGTH * UTF16LE_BYTES_PER_CHAR;
 
-                while let Some((pos, char_idx)) = stack.pop() {
-                    if found.load(Ordering::Relaxed) {
-                        break;
-                    }
+    // Double buffering setup
+    let mut batches = [vec![0u8; BATCH_SIZE * input_bytes_per_pwd], vec![0u8; BATCH_SIZE * input_bytes_per_pwd]];
+    let mut hashes_bufs = [vec![0u8; BATCH_SIZE * 20], vec![0u8; BATCH_SIZE * 20]];
+    let mut d_inputs = [DeviceBuffer::zeroed(BATCH_SIZE * input_bytes_per_pwd)?, DeviceBuffer::zeroed(BATCH_SIZE * input_bytes_per_pwd)?];
+    let d_hashes = [DeviceBuffer::<u8>::zeroed(BATCH_SIZE * 20)?, DeviceBuffer::<u8>::zeroed(BATCH_SIZE * 20)?];
+    let stream0 = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+    let stream1 = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+    // Use array of Stream, not references
+    let mut streams = [stream0, stream1];
 
-                    pwd[pos] = CHARSET[char_idx];
+    let threads_per_block = 1024u32;
+    let blocks = ((BATCH_SIZE as u32) + threads_per_block - 1) / threads_per_block;
 
-                    if pos + 1 == MAX_LENGTH {
-                        let s = String::from_utf8_lossy(&pwd);
-                        let utf16le_bytes = to_utf16le_bytes(&s);
-                        let mut hasher = Sha1::new();
-                        hasher.update(&utf16le_bytes);
-                        let hash = hasher.finalize();
+    let mut batch_start = 0u128;
+    let mut buf_idx = 0;
+    let mut prev_count = 0;
+    let mut prev_launched = false;
 
-                        tested.fetch_add(1, Ordering::Relaxed);
+    while batch_start < total {
+        // Prepare batch
+        let batch = &mut batches[buf_idx];
+        let mut count = 0;
+        let mut chars = [0u8; MAX_LENGTH];
+        let mut utf16 = [0u16; MAX_LENGTH];
+        for i in 0..BATCH_SIZE {
+            let idx = batch_start + i as u128;
+            if idx >= total {
+                break;
+            }
+            let mut n = idx;
+            for j in 0..MAX_LENGTH {
+                chars[j] = CHARSET[(n % charset_len as u128) as usize];
+                n /= charset_len as u128;
+            }
+            // Encode as UTF-16LE without heap allocation
+            let s = &chars;
+            let mut utf16_len = 0;
+            for (j, c) in String::from_utf8_lossy(s).chars().enumerate() {
+                utf16[j] = c as u16;
+                utf16_len += 1;
+            }
+            for j in 0..utf16_len {
+                let bytes = utf16[j].to_le_bytes();
+                batch[i * input_bytes_per_pwd + j * 2] = bytes[0];
+                batch[i * input_bytes_per_pwd + j * 2 + 1] = bytes[1];
+            }
+            count += 1;
+        }
 
-                        if hash.as_slice() == target_hash {
-                            found.store(true, Ordering::Relaxed);
-                            let password = s.trim_end_matches(char::from(0)).to_string();
-                            let _ = write("found_password.txt", &password);
-                            println!(
-                                "[FOUND] Password: '{}' in {:.1} seconds after {} attempts",
-                                password,
-                                start_time.elapsed().as_secs_f64(),
-                                tested.load(Ordering::Relaxed)
-                            );
-                            return;
-                        }
-                    } else {
-                        for i in (0..CHARSET.len()).rev() {
-                            stack.push((pos + 1, i));
-                        }
-                    }
-                }
-            })
-        })
-        .collect();
+        // Async copy to device
+        d_inputs[buf_idx].copy_from(&batch[..])?;
 
-    // Progress reporting thread
-    {
-        let tested = Arc::clone(&tested);
-        let found = Arc::clone(&found);
-        let start_time = start_time.clone();
+        // Launch kernel
+        let stream = &mut streams[buf_idx];
+        unsafe {
+            launch!(func<<<blocks, threads_per_block, 0, stream>>>(
+                d_inputs[buf_idx].as_device_ptr(),
+                input_bytes_per_pwd as i32,
+                d_hashes[buf_idx].as_device_ptr(),
+                BATCH_SIZE as i32
+            ))?;
+        }
 
-        thread::spawn(move || {
-            let mut last_checked = 0u64;
-            let mut last_reported = 0u64;
-            let mut last_time = Instant::now();
-
-            loop {
-                thread::sleep(Duration::from_millis(200));
-
-                if found.load(Ordering::Relaxed) {
+        // If not the first batch, copy results from previous buffer while this one runs
+        if prev_launched {
+            streams[1 - buf_idx].synchronize()?;
+            d_hashes[1 - buf_idx].copy_to(&mut hashes_bufs[1 - buf_idx])?;
+            for i in 0..prev_count {
+                if hashes_bufs[1 - buf_idx][i * 20..(i + 1) * 20] == target_hash[..] {
+                    found = true;
+                    let utf16: Vec<u16> = (0..MAX_LENGTH)
+                        .map(|j| u16::from_le_bytes([
+                            batches[1 - buf_idx][i * input_bytes_per_pwd + j * 2],
+                            batches[1 - buf_idx][i * input_bytes_per_pwd + j * 2 + 1],
+                        ]))
+                        .collect();
+                    found_pwd = String::from_utf16_lossy(&utf16).into_bytes();
                     break;
                 }
-
-                let checked = tested.load(Ordering::Relaxed);
-                let delta = checked - last_checked;
-                let elapsed = last_time.elapsed().as_secs_f64();
-
-                if checked - last_reported >= 100_000_000 {
-                    let total_elapsed = start_time.elapsed().as_secs_f64();
-                    let speed = (delta as f64) / elapsed;
-                    println!(
-                        "[INFO] Checked {:>11} passwords in {:>5.1}s ({:>10.0} passwords/sec)",
-                        checked,
-                        total_elapsed,
-                        speed
-                    );
-                    last_checked = checked;
-                    last_reported = checked;
-                    last_time = Instant::now();
-                }
             }
-        });
+            if found {
+                break;
+            }
+        }
+
+        prev_count = count;
+        prev_launched = true;
+        batch_start += BATCH_SIZE as u128;
+        buf_idx = 1 - buf_idx;
     }
 
-    for t in threads {
-        let _ = t.join();
+    // Final synchronize and check last buffer
+    if prev_launched && !found {
+        streams[1 - buf_idx].synchronize()?;
+        d_hashes[1 - buf_idx].copy_to(&mut hashes_bufs[1 - buf_idx])?;
+        for i in 0..prev_count {
+            if hashes_bufs[1 - buf_idx][i * 20..(i + 1) * 20] == target_hash[..] {
+                found = true;
+                let utf16: Vec<u16> = (0..MAX_LENGTH)
+                    .map(|j| u16::from_le_bytes([
+                        batches[1 - buf_idx][i * input_bytes_per_pwd + j * 2],
+                        batches[1 - buf_idx][i * input_bytes_per_pwd + j * 2 + 1],
+                    ]))
+                    .collect();
+                found_pwd = String::from_utf16_lossy(&utf16).into_bytes();
+                break;
+            }
+        }
     }
 
-    if !found.load(Ordering::Relaxed) {
+    if found {
+        let pwd_str = String::from_utf8_lossy(&found_pwd);
+        println!("[FOUND] Password: {} in {:.2} seconds", pwd_str, start_time.elapsed().as_secs_f64());
+    } else {
         println!("Password not found.");
     }
+    Ok(())
+
+    // PERFORMANCE NOTE:
+    // If you run out of memory, reduce BATCH_SIZE (try 262144 or 131072).
+    // For even more speed, run multiple processes (if you have multiple GPUs).
 }
