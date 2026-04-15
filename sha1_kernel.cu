@@ -1,74 +1,122 @@
-// CUDA SHA1 kernel for batch password hashing (lowercase a-z, 6 chars)
-// Each thread processes one input string of length input_len
+#include <stdint.h>
 
-__device__ void sha1_transform(const unsigned char* data, unsigned int* state);
+extern "C" {
 
-extern "C" __global__ void sha1_kernel(const unsigned char* inputs, int input_len, unsigned char* hashes, int num_inputs) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_inputs) return;
+#define ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
 
-    // Each input is input_len bytes
-    const unsigned char* input = inputs + idx * input_len;
-    unsigned int state[5] = {
-        0x67452301,
-        0xEFCDAB89,
-        0x98BADCFE,
-        0x10325476,
-        0xC3D2E1F0
-    };
-    unsigned char block[64] = {0};
-    int i;
-    for (i = 0; i < input_len && i < 64; ++i) block[i] = input[i];
-    block[input_len] = 0x80;
-    unsigned long long bit_len = ((unsigned long long)input_len) * 8ULL;
-    block[56] = (bit_len >> 56) & 0xff;
-    block[57] = (bit_len >> 48) & 0xff;
-    block[58] = (bit_len >> 40) & 0xff;
-    block[59] = (bit_len >> 32) & 0xff;
-    block[60] = (bit_len >> 24) & 0xff;
-    block[61] = (bit_len >> 16) & 0xff;
-    block[62] = (bit_len >> 8) & 0xff;
-    block[63] = (bit_len) & 0xff;
-    sha1_transform(block, state);
-    for (i = 0; i < 5; ++i) {
-        hashes[idx * 20 + i * 4 + 0] = (state[i] >> 24) & 0xff;
-        hashes[idx * 20 + i * 4 + 1] = (state[i] >> 16) & 0xff;
-        hashes[idx * 20 + i * 4 + 2] = (state[i] >> 8) & 0xff;
-        hashes[idx * 20 + i * 4 + 3] = (state[i]) & 0xff;
+// Target hash (5 x uint32, big-endian words) – written by host via module symbol
+__constant__ uint32_t d_target[5];
+
+// Character set – written by host via module symbol
+__constant__ uint8_t d_charset[26];
+
+__global__ void sha1_kernel(
+    uint64_t  start_idx,
+    int       pwd_len,
+    int       batch_size,
+    int*      found_flag,
+    uint64_t* found_idx)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= batch_size) return;
+
+    // Early-exit if another thread already found it
+    if (*found_flag) return;
+
+    // ------------------------------------------------------------------ //
+    // 1.  Decode candidate index → character array (most-significant first)
+    // ------------------------------------------------------------------ //
+    uint64_t n = start_idx + (uint64_t)tid;
+
+    // Build digits LSB-first, then reverse so index 0 → 'a'…'a'…'a'
+    uint8_t chars[16];
+    for (int j = pwd_len - 1; j >= 0; j--) {
+        chars[j] = d_charset[n % 26];
+        n /= 26;
+    }
+
+    // ------------------------------------------------------------------ //
+    // 2.  Encode as UTF-16LE and lay out the SHA-1 message block
+    // ------------------------------------------------------------------ //
+    // For a 6-char password the UTF-16LE message is 12 bytes, well within
+    // one 64-byte SHA-1 block.
+    uint8_t msg[64] = {0};
+    int byte_len = pwd_len * 2;          // UTF-16LE: 2 bytes per char
+    for (int j = 0; j < pwd_len; j++) {
+        msg[j * 2]     = chars[j];       // low byte  (ASCII → same value)
+        msg[j * 2 + 1] = 0x00;          // high byte (all ASCII < 128)
+    }
+
+    // SHA-1 padding
+    msg[byte_len] = 0x80;
+    // bit-length as 64-bit big-endian at bytes 56-63
+    uint64_t bit_len = (uint64_t)byte_len * 8;
+    msg[56] = (uint8_t)(bit_len >> 56);
+    msg[57] = (uint8_t)(bit_len >> 48);
+    msg[58] = (uint8_t)(bit_len >> 40);
+    msg[59] = (uint8_t)(bit_len >> 32);
+    msg[60] = (uint8_t)(bit_len >> 24);
+    msg[61] = (uint8_t)(bit_len >> 16);
+    msg[62] = (uint8_t)(bit_len >>  8);
+    msg[63] = (uint8_t)(bit_len      );
+
+    // Convert byte array → 16 big-endian uint32 words
+    uint32_t w[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)msg[i*4  ] << 24)
+             | ((uint32_t)msg[i*4+1] << 16)
+             | ((uint32_t)msg[i*4+2] <<  8)
+             | ((uint32_t)msg[i*4+3]      );
+    }
+
+    // ------------------------------------------------------------------ //
+    // 3.  SHA-1 compression
+    // ------------------------------------------------------------------ //
+    uint32_t a = 0x67452301u;
+    uint32_t b = 0xEFCDAB89u;
+    uint32_t c = 0x98BADCFEu;
+    uint32_t d = 0x10325476u;
+    uint32_t e = 0xC3D2E1F0u;
+
+    #pragma unroll
+    for (int i = 0; i < 80; i++) {
+        if (i >= 16) {
+            w[i & 15] = ROTL32(
+                w[(i-3)  & 15] ^
+                w[(i-8)  & 15] ^
+                w[(i-14) & 15] ^
+                w[ i     & 15], 1);
+        }
+
+        uint32_t f, k;
+        if      (i < 20) { f = (b & c) | (~b & d);           k = 0x5A827999u; }
+        else if (i < 40) { f =  b ^ c ^ d;                   k = 0x6ED9EBA1u; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+        else             { f =  b ^ c ^ d;                   k = 0xCA62C1D6u; }
+
+        uint32_t temp = ROTL32(a, 5) + f + e + k + w[i & 15];
+        e = d; d = c; c = ROTL32(b, 30); b = a; a = temp;
+    }
+
+    // Add initial hash values
+    a += 0x67452301u;
+    b += 0xEFCDAB89u;
+    c += 0x98BADCFEu;
+    d += 0x10325476u;
+    e += 0xC3D2E1F0u;
+
+    // ------------------------------------------------------------------ //
+    // 4.  Compare all 5 words against the target
+    // ------------------------------------------------------------------ //
+    if (a == d_target[0] && b == d_target[1] &&
+        c == d_target[2] && d == d_target[3] && e == d_target[4])
+    {
+        // Use atomicCAS so only one thread wins the race
+        if (atomicCAS(found_flag, 0, 1) == 0) {
+            *found_idx = start_idx + (uint64_t)tid;
+        }
     }
 }
 
-// Minimal SHA1 transform implementation for a single 64-byte block
-__device__ void sha1_transform(const unsigned char* data, unsigned int* state) {
-    unsigned int a, b, c, d, e, f, k, temp;
-    unsigned int w[80];
-    int i;
-    for (i = 0; i < 16; ++i) {
-        w[i] = (data[i * 4 + 0] << 24) |
-               (data[i * 4 + 1] << 16) |
-               (data[i * 4 + 2] << 8) |
-               (data[i * 4 + 3]);
-    }
-    for (i = 16; i < 80; ++i) {
-        w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
-        w[i] = (w[i] << 1) | (w[i] >> 31);
-    }
-    a = state[0]; b = state[1]; c = state[2]; d = state[3]; e = state[4];
-    for (i = 0; i < 80; ++i) {
-        if (i < 20)      { f = (b & c) | ((~b) & d); k = 0x5A827999; }
-        else if (i < 40) { f = b ^ c ^ d;            k = 0x6ED9EBA1; }
-        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-        else             { f = b ^ c ^ d;            k = 0xCA62C1D6; }
-        temp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
-        e = d;
-        d = c;
-        c = (b << 30) | (b >> 2);
-        b = a;
-        a = temp;
-    }
-    state[0] += a;
-    state[1] += b;
-    state[2] += c;
-    state[3] += d;
-    state[4] += e;
-}
+} // extern "C"
