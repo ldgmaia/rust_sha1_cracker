@@ -3,9 +3,11 @@ use cust::memory::DeviceBox;
 use std::ffi::CStr;
 use std::error::Error;
 use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // -----------------------------------------------------------------------
-// Configuration – change CHARSET and PWD_LEN to match your target
+// Configuration – change CHARSET and PWD_LEN_MIN/MAX to match your target
 // -----------------------------------------------------------------------
 const TARGET_HASH: &str = "B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086";
 
@@ -13,12 +15,16 @@ const TARGET_HASH: &str = "B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086";
 const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
 // const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-const PWD_LEN_MIN: usize = 5;
-const PWD_LEN_MAX: usize = 5;
+const PWD_LEN_MIN: usize = 1;
+const PWD_LEN_MAX: usize = 6;
 
-// Tuning – saturate the GB10 (2048 CUDA cores)
-const THREADS_PER_BLOCK: u32 = 512;
-const BLOCKS: u32 = 8192;
+// Tuning – GB10 Blackwell (32 regs/thread = 100% theoretical occupancy)
+// Grid: 512 blocks x 256 threads = 131 072 resident threads
+const THREADS_PER_BLOCK: u32 = 256;
+const BLOCKS: u32            = 512;
+
+// How often the progress heartbeat prints while a length is running
+const PROGRESS_INTERVAL_SECS: u64 = 30;
 
 // -----------------------------------------------------------------------
 // Decode a base-N index back to a password string
@@ -86,72 +92,92 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ------------------------------------------------------------------- //
     // 5.  Search loop (iterates over each length from MIN to MAX)
     // ------------------------------------------------------------------- //
-    let batch_size = (THREADS_PER_BLOCK as u64) * (BLOCKS as u64);
     let start_time = Instant::now();
 
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
     println!("[*] GPU SHA-1 brute-force starting…");
-    println!("    charset size={} | pwd_len range=[{}..{}]",
+    println!("    charset size={} | pwd_len range=[{}..={}]",
         charset_len, PWD_LEN_MIN, PWD_LEN_MAX);
-    println!("    batch={} ({} blocks × {} threads)",
-        batch_size, BLOCKS, THREADS_PER_BLOCK);
+    println!("    grid={} blocks x {} threads | single launch per length",
+        BLOCKS, THREADS_PER_BLOCK);
+
+    // Track measured speed so heartbeat estimate improves after each length
+    let mut last_speed_bps: f64 = 1_830_000_000.0;
 
     for pwd_len in PWD_LEN_MIN..=PWD_LEN_MAX {
         let total_combinations = (charset_len as u64).pow(pwd_len as u32);
-        let mut current_start = 0u64;
 
-        // Reset device flags for this length
         found_flag.copy_from(&0i32)?;
         found_idx.copy_from(&0u64)?;
 
-        println!("\n[*] Trying length {} | search space={}", pwd_len, total_combinations);
+        println!("\n[*] Trying length {} | search space={:e}",
+            pwd_len, total_combinations as f64);
 
-        while current_start < total_combinations {
-            let count = batch_size.min(total_combinations - current_start);
+        // Heartbeat thread: polls every 200 ms, prints every PROGRESS_INTERVAL_SECS
+        let running    = Arc::new(AtomicBool::new(true));
+        let run_clone  = Arc::clone(&running);
+        let length_start = Instant::now();
+        let total_f64    = total_combinations as f64;
+        let speed_hint   = last_speed_bps;
 
-            unsafe {
-                launch!(func<<<BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
-                    current_start,
-                    pwd_len as i32,
-                    charset_len as i32,
-                    count as i32,
-                    found_flag.as_device_ptr(),
-                    found_idx.as_device_ptr()
-                ))?;
+        let timer = std::thread::spawn(move || {
+            let poll    = std::time::Duration::from_millis(200);
+            let every   = std::time::Duration::from_secs(PROGRESS_INTERVAL_SECS);
+            let mut next = Instant::now() + every;
+            while run_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(poll);
+                if !run_clone.load(Ordering::Relaxed) { break; }
+                if Instant::now() >= next {
+                    let elapsed = length_start.elapsed().as_secs_f64();
+                    let pct = (elapsed * speed_hint / total_f64 * 100.0).min(99.9);
+                    println!("    ... ~{:.1}% done | elapsed: {:.0}s", pct, elapsed);
+                    next += every;
+                }
             }
+        });
 
-            stream.synchronize()?;
-
-            let mut host_flag = 0i32;
-            found_flag.copy_to(&mut host_flag)?;
-            if host_flag == 1 {
-                let mut win_idx = 0u64;
-                found_idx.copy_to(&mut win_idx)?;
-                let password = decode_idx(win_idx, pwd_len);
-                println!(
-                    "\n[FOUND] Password: '{}' (length {}) | Time: {:?}",
-                    password, pwd_len, start_time.elapsed()
-                );
-                return Ok(());
-            }
-
-            current_start += count;
-
-            let elapsed = start_time.elapsed().as_secs_f64().max(1e-9);
-            let speed   = current_start as f64 / elapsed;
-            let pct     = current_start as f64 / total_combinations as f64 * 100.0;
-            print!(
-                "\r  len={} [{:6.2}%] {:6.2}B pwd/s  elapsed: {:.1}s   ",
-                pwd_len, pct, speed / 1e9, elapsed
-            );
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+        // Single kernel launch covering ALL candidates for this length
+        unsafe {
+            launch!(func<<<BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
+                0u64,
+                total_combinations,
+                pwd_len as i32,
+                charset_len as i32,
+                found_flag.as_device_ptr(),
+                found_idx.as_device_ptr()
+            ))?;
         }
 
-        println!("\n[!] Length {} exhausted. Password not found at this length.", pwd_len);
+        stream.synchronize()?;
+
+        // Stop heartbeat (returns within 200 ms)
+        running.store(false, Ordering::Relaxed);
+        let _ = timer.join();
+
+        let elapsed = length_start.elapsed();
+        let speed = total_combinations as f64 / elapsed.as_secs_f64();
+        last_speed_bps = speed;
+
+        let mut host_flag = 0i32;
+        found_flag.copy_to(&mut host_flag)?;
+        if host_flag == 1 {
+            let mut win_idx = 0u64;
+            found_idx.copy_to(&mut win_idx)?;
+            let password = decode_idx(win_idx, pwd_len);
+            println!(
+                "\n[FOUND] Password: '{}' (length {}) | Time: {:?}",
+                password, pwd_len, start_time.elapsed()
+            );
+            return Ok(());
+        }
+
+        println!(
+            "[!] Length {} done | {:.1}s | {:.2}B pwd/s | Password not found.",
+            pwd_len, elapsed.as_secs_f64(), speed / 1e9
+        );
     }
 
-    println!("[!] Search complete. Password not found in range [{}..(=){}].", PWD_LEN_MIN, PWD_LEN_MAX);
+    println!("[!] Search complete. Password not found in range [{}..={}].", PWD_LEN_MIN, PWD_LEN_MAX);
     Ok(())
 }

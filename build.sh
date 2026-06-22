@@ -3,7 +3,7 @@
 set -e
 
 echo "=== 1/2  Compiling CUDA kernel to PTX ==="
-nvcc -ptx sha1_kernel.cu -o sha1_kernel.ptx -arch=sm_90 --use_fast_math -O3
+nvcc -ptx sha1_kernel.cu -o sha1_kernel.ptx -arch=sm_121 --use_fast_math -O3
 
 mkdir -p target/release
 cp sha1_kernel.ptx target/release/
