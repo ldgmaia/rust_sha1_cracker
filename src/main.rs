@@ -7,13 +7,14 @@ use std::time::Instant;
 // -----------------------------------------------------------------------
 // Configuration – change CHARSET and PWD_LEN to match your target
 // -----------------------------------------------------------------------
-const TARGET_HASH: &str = "689851ea6905b22a03dd79cee862c3f73d4cb4d2";
+const TARGET_HASH: &str = "B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086";
 
 // All printable ASCII: lowercase, uppercase, digits, symbols (95 chars)
-const CHARSET: &[u8] =
-    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
+// const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-const PWD_LEN: usize = 6;
+const PWD_LEN_MIN: usize = 5;
+const PWD_LEN_MAX: usize = 5;
 
 // Tuning – saturate the GB10 (2048 CUDA cores)
 const THREADS_PER_BLOCK: u32 = 512;
@@ -79,67 +80,78 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ------------------------------------------------------------------- //
     // 4.  Device buffers
     // ------------------------------------------------------------------- //
-    let found_flag = DeviceBox::new(&0i32)?;
-    let found_idx  = DeviceBox::new(&0u64)?;
+    let mut found_flag = DeviceBox::new(&0i32)?;
+    let mut found_idx  = DeviceBox::new(&0u64)?;
 
     // ------------------------------------------------------------------- //
-    // 5.  Search loop
+    // 5.  Search loop (iterates over each length from MIN to MAX)
     // ------------------------------------------------------------------- //
     let batch_size = (THREADS_PER_BLOCK as u64) * (BLOCKS as u64);
-    let total_combinations = (charset_len as u64).pow(PWD_LEN as u32);
-    let mut current_start = 0u64;
     let start_time = Instant::now();
 
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
     println!("[*] GPU SHA-1 brute-force starting…");
-    println!("    charset size={} | pwd_len={} | search space={}",
-        charset_len, PWD_LEN, total_combinations);
+    println!("    charset size={} | pwd_len range=[{}..{}]",
+        charset_len, PWD_LEN_MIN, PWD_LEN_MAX);
     println!("    batch={} ({} blocks × {} threads)",
         batch_size, BLOCKS, THREADS_PER_BLOCK);
 
-    while current_start < total_combinations {
-        let count = batch_size.min(total_combinations - current_start);
+    for pwd_len in PWD_LEN_MIN..=PWD_LEN_MAX {
+        let total_combinations = (charset_len as u64).pow(pwd_len as u32);
+        let mut current_start = 0u64;
 
-        unsafe {
-            launch!(func<<<BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
-                current_start,
-                PWD_LEN as i32,
-                charset_len as i32,
-                count as i32,
-                found_flag.as_device_ptr(),
-                found_idx.as_device_ptr()
-            ))?;
-        }
+        // Reset device flags for this length
+        found_flag.copy_from(&0i32)?;
+        found_idx.copy_from(&0u64)?;
 
-        stream.synchronize()?;
+        println!("\n[*] Trying length {} | search space={}", pwd_len, total_combinations);
 
-        let mut host_flag = 0i32;
-        found_flag.copy_to(&mut host_flag)?;
-        if host_flag == 1 {
-            let mut win_idx = 0u64;
-            found_idx.copy_to(&mut win_idx)?;
-            let password = decode_idx(win_idx, PWD_LEN);
-            println!(
-                "\n[FOUND] Password: '{}' | Time: {:?}",
-                password, start_time.elapsed()
+        while current_start < total_combinations {
+            let count = batch_size.min(total_combinations - current_start);
+
+            unsafe {
+                launch!(func<<<BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
+                    current_start,
+                    pwd_len as i32,
+                    charset_len as i32,
+                    count as i32,
+                    found_flag.as_device_ptr(),
+                    found_idx.as_device_ptr()
+                ))?;
+            }
+
+            stream.synchronize()?;
+
+            let mut host_flag = 0i32;
+            found_flag.copy_to(&mut host_flag)?;
+            if host_flag == 1 {
+                let mut win_idx = 0u64;
+                found_idx.copy_to(&mut win_idx)?;
+                let password = decode_idx(win_idx, pwd_len);
+                println!(
+                    "\n[FOUND] Password: '{}' (length {}) | Time: {:?}",
+                    password, pwd_len, start_time.elapsed()
+                );
+                return Ok(());
+            }
+
+            current_start += count;
+
+            let elapsed = start_time.elapsed().as_secs_f64().max(1e-9);
+            let speed   = current_start as f64 / elapsed;
+            let pct     = current_start as f64 / total_combinations as f64 * 100.0;
+            print!(
+                "\r  len={} [{:6.2}%] {:6.2}B pwd/s  elapsed: {:.1}s   ",
+                pwd_len, pct, speed / 1e9, elapsed
             );
-            return Ok(());
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
         }
 
-        current_start += count;
-
-        let elapsed = start_time.elapsed().as_secs_f64().max(1e-9);
-        let speed   = current_start as f64 / elapsed;
-        let pct     = current_start as f64 / total_combinations as f64 * 100.0;
-        print!(
-            "\r[{:6.2}%] {:6.2}B pwd/s  elapsed: {:.1}s   ",
-            pct, speed / 1e9, elapsed
-        );
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+        println!("\n[!] Length {} exhausted. Password not found at this length.", pwd_len);
     }
 
-    println!("\n[!] Search complete. Password not found.");
+    println!("[!] Search complete. Password not found in range [{}..(=){}].", PWD_LEN_MIN, PWD_LEN_MAX);
     Ok(())
 }
