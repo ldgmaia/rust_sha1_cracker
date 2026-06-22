@@ -7,12 +7,13 @@ extern "C" {
 // Target hash (5 x uint32, big-endian words) – written by host via module symbol
 __constant__ uint32_t d_target[5];
 
-// Character set – written by host via module symbol
-__constant__ uint8_t d_charset[26];
+// Character set – written by host via module symbol (up to 96 printable ASCII chars)
+__constant__ uint8_t d_charset[96];
 
 __global__ void sha1_kernel(
     uint64_t  start_idx,
     int       pwd_len,
+    int       charset_len,
     int       batch_size,
     int*      found_flag,
     uint64_t* found_idx)
@@ -28,28 +29,24 @@ __global__ void sha1_kernel(
     // ------------------------------------------------------------------ //
     uint64_t n = start_idx + (uint64_t)tid;
 
-    // Build digits LSB-first, then reverse so index 0 → 'a'…'a'…'a'
     uint8_t chars[16];
     for (int j = pwd_len - 1; j >= 0; j--) {
-        chars[j] = d_charset[n % 26];
-        n /= 26;
+        chars[j] = d_charset[n % charset_len];
+        n /= charset_len;
     }
 
     // ------------------------------------------------------------------ //
     // 2.  Encode as UTF-16LE and lay out the SHA-1 message block
     // ------------------------------------------------------------------ //
-    // For a 6-char password the UTF-16LE message is 12 bytes, well within
-    // one 64-byte SHA-1 block.
     uint8_t msg[64] = {0};
-    int byte_len = pwd_len * 2;          // UTF-16LE: 2 bytes per char
+    int byte_len = pwd_len * 2;
     for (int j = 0; j < pwd_len; j++) {
-        msg[j * 2]     = chars[j];       // low byte  (ASCII → same value)
-        msg[j * 2 + 1] = 0x00;          // high byte (all ASCII < 128)
+        msg[j * 2]     = chars[j];
+        msg[j * 2 + 1] = 0x00;
     }
 
     // SHA-1 padding
     msg[byte_len] = 0x80;
-    // bit-length as 64-bit big-endian at bytes 56-63
     uint64_t bit_len = (uint64_t)byte_len * 8;
     msg[56] = (uint8_t)(bit_len >> 56);
     msg[57] = (uint8_t)(bit_len >> 48);
@@ -99,7 +96,6 @@ __global__ void sha1_kernel(
         e = d; d = c; c = ROTL32(b, 30); b = a; a = temp;
     }
 
-    // Add initial hash values
     a += 0x67452301u;
     b += 0xEFCDAB89u;
     c += 0x98BADCFEu;
@@ -112,7 +108,6 @@ __global__ void sha1_kernel(
     if (a == d_target[0] && b == d_target[1] &&
         c == d_target[2] && d == d_target[3] && e == d_target[4])
     {
-        // Use atomicCAS so only one thread wins the race
         if (atomicCAS(found_flag, 0, 1) == 0) {
             *found_idx = start_idx + (uint64_t)tid;
         }

@@ -5,31 +5,38 @@ use std::error::Error;
 use std::time::Instant;
 
 // -----------------------------------------------------------------------
-// Configuration
+// Configuration – change CHARSET and PWD_LEN to match your target
 // -----------------------------------------------------------------------
-const TARGET_HASH: &str = "2eec0a11782dd531aa9d0fcac4bbdef1af711c84";
-const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+const TARGET_HASH: &str = "689851ea6905b22a03dd79cee862c3f73d4cb4d2";
+
+// All printable ASCII: lowercase, uppercase, digits, symbols (95 chars)
+const CHARSET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+
 const PWD_LEN: usize = 6;
 
-// Tuning knobs – saturate the GB10 (2048 CUDA cores)
-// 512 threads/block × 8192 blocks = 4 194 304 candidates per launch
+// Tuning – saturate the GB10 (2048 CUDA cores)
 const THREADS_PER_BLOCK: u32 = 512;
 const BLOCKS: u32 = 8192;
 
 // -----------------------------------------------------------------------
-// Decode a base-26 index back to a password string
+// Decode a base-N index back to a password string
 // -----------------------------------------------------------------------
 fn decode_idx(mut n: u64, len: usize) -> String {
+    let cs = CHARSET.len() as u64;
     let mut chars = Vec::with_capacity(len);
     for _ in 0..len {
-        chars.push(CHARSET[(n % 26) as usize] as char);
-        n /= 26;
+        chars.push(CHARSET[(n % cs) as usize] as char);
+        n /= cs;
     }
     chars.reverse();
     chars.into_iter().collect()
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let charset_len = CHARSET.len();
+    assert!(charset_len <= 96, "CHARSET too large (max 96)");
+
     // ------------------------------------------------------------------- //
     // 1.  Parse target hash → 5 big-endian uint32 words
     // ------------------------------------------------------------------- //
@@ -49,18 +56,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device = Device::get_device(0)?;
     let _ctx = Context::new(device)?;
 
-    // Load pre-compiled PTX
     let module = Module::from_file("sha1_kernel.ptx")?;
     let func = module.get_function("sha1_kernel")?;
 
     // ------------------------------------------------------------------- //
     // 3.  Copy constant data to device globals
     // ------------------------------------------------------------------- //
-    // Charset
-    let mut d_charset = module.get_global::<[u8; 26]>(
+    // Charset – pad to 96 bytes
+    let mut charset_padded = [0u8; 96];
+    charset_padded[..charset_len].copy_from_slice(CHARSET);
+    let mut d_charset = module.get_global::<[u8; 96]>(
         CStr::from_bytes_with_nul(b"d_charset\0").unwrap()
     )?;
-    d_charset.copy_from(&CHARSET.try_into().unwrap())?;
+    d_charset.copy_from(&charset_padded)?;
 
     // Target hash
     let mut d_target = module.get_global::<[u32; 5]>(
@@ -69,7 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     d_target.copy_from(&target_u32)?;
 
     // ------------------------------------------------------------------- //
-    // 4.  Device buffers for the "found" flag and winning index
+    // 4.  Device buffers
     // ------------------------------------------------------------------- //
     let found_flag = DeviceBox::new(&0i32)?;
     let found_idx  = DeviceBox::new(&0u64)?;
@@ -78,15 +86,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 5.  Search loop
     // ------------------------------------------------------------------- //
     let batch_size = (THREADS_PER_BLOCK as u64) * (BLOCKS as u64);
-    let total_combinations = (CHARSET.len() as u64).pow(PWD_LEN as u32);
+    let total_combinations = (charset_len as u64).pow(PWD_LEN as u32);
     let mut current_start = 0u64;
     let start_time = Instant::now();
 
     let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
     println!("[*] GPU SHA-1 brute-force starting…");
-    println!("    charset={} | len={} | space={}",
-        std::str::from_utf8(CHARSET).unwrap(), PWD_LEN, total_combinations);
+    println!("    charset size={} | pwd_len={} | search space={}",
+        charset_len, PWD_LEN, total_combinations);
     println!("    batch={} ({} blocks × {} threads)",
         batch_size, BLOCKS, THREADS_PER_BLOCK);
 
@@ -97,16 +105,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             launch!(func<<<BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
                 current_start,
                 PWD_LEN as i32,
+                charset_len as i32,
                 count as i32,
                 found_flag.as_device_ptr(),
                 found_idx.as_device_ptr()
             ))?;
         }
 
-        // Wait for the GPU to finish this batch before reading results
         stream.synchronize()?;
 
-        // Check the flag
         let mut host_flag = 0i32;
         found_flag.copy_to(&mut host_flag)?;
         if host_flag == 1 {
@@ -122,7 +129,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         current_start += count;
 
-        // Progress report
         let elapsed = start_time.elapsed().as_secs_f64().max(1e-9);
         let speed   = current_start as f64 / elapsed;
         let pct     = current_start as f64 / total_combinations as f64 * 100.0;
