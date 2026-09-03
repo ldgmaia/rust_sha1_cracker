@@ -28,23 +28,28 @@ This project brute-forces a SHA-1 hash using a CUDA kernel and a Rust host progr
   - Compiles `sha1_kernel.cu` to `sha1_kernel.ptx`
   - Builds the Rust binary in release mode
 
-4. Run from the release folder (so the binary can find `sha1_kernel.ptx`).
+4. Run from the release folder (so the binary can find `sha1_kernel.ptx` and
+   `known_passwords.txt`). `--hash` is required.
 
   `cd target/release`
 
-  `./rust_sha1_cracker`
+  `./rust_sha1_cracker --hash <YOUR_TARGET_HASH>`
+
+  Running `./rust_sha1_cracker` from anywhere else (e.g. the project root) fails with
+  `No such file or directory` — the binary only exists under `target/release/` after `./build.sh`.
 
 ## Command-Line Options
 
-All of the options below have defaults baked into [src/main.rs](src/main.rs) (edit and rebuild
-to change the defaults), but you can override them per run without rebuilding:
+`--hash` is required on every run. The other options have defaults baked into
+[src/main.rs](src/main.rs) (edit and rebuild to change the defaults), but you can override
+them per run without rebuilding:
 
-| Flag | Short | Description | Example |
-|---|---|---|---|
-| `--hash` | `-H` | Target SHA-1 hash (40 hex chars, `sha1(utf16le($pass))`) | `--hash B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086` |
-| `--length-min` | | Minimum password length to try | `--length-min 6` |
-| `--length-max` | | Maximum password length to try | `--length-max 8` |
-| `--charset` | `-c` | Character set: `letters`, `numbers`, `alphanumeric`, `all` | `--charset alphanumeric` |
+| Flag | Short | Required | Description | Example |
+|---|---|---|---|---|
+| `--hash` | `-H` | Yes | Target SHA-1 hash (40 hex chars, `sha1(utf16le($pass))`) | `--hash B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086` |
+| `--length-min` | | No | Minimum password length to try | `--length-min 6` |
+| `--length-max` | | No | Maximum password length to try | `--length-max 8` |
+| `--charset` | `-c` | No | Character set: `letters`, `numbers`, `alphanumeric`, `all` | `--charset alphanumeric` |
 
 Examples:
 
@@ -60,17 +65,20 @@ Examples:
 
 Use this when you want the cracker to keep running after you close the terminal.
 
-1. Start from the project root.
+1. Go to the release folder (so the binary can find `sha1_kernel.ptx` and `known_passwords.txt`).
 
-  `cd rust_sha1_cracker`
+  `cd rust_sha1_cracker/target/release`
 
-2. Start the process with `nohup` and redirect output to a log file.
+2. Start the process with `nohup`, passing your crack parameters, and redirect output to a
+   log file. `--hash` is required; see [Command-Line Options](#command-line-options) for the rest.
 
   Example:
 
-  `nohup cargo run --release > output-7char-all-B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086.log 2>&1 &`
+  `nohup ./rust_sha1_cracker --hash FA3569135BCE3660ED2C3CB9E977790BED926E9D --charset alphanumeric --length-min 9 --length-max 10 > output-9to10char-alphanumeric-FA3569135BCE3660ED2C3CB9E977790BED926E9D.log 2>&1 &`
 
-  You can change the log file name to match your run settings.
+  Name the log file after the run's parameters (hash/charset/length range) so it stays
+  identifiable later, and add new ones to `.gitignore` (already covers `*.log`) instead of
+  committing them.
 
 3. Save the process ID (PID) shown by the shell (for example: `[1] 12345`).
 
@@ -78,7 +86,7 @@ Use this when you want the cracker to keep running after you close the terminal.
 
 1. Follow live logs:
 
-  `tail -f output-7char-all-B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086.log`
+  `tail -f output-9to10char-alphanumeric-FA3569135BCE3660ED2C3CB9E977790BED926E9D.log`
 
 2. Confirm process is still running:
 
