@@ -1,0 +1,13 @@
+[package]
+name = "rust_sha1_cracker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rust_sha1_cracker"
+path = "src/main.rs"
+
+[dependencies]
+cust = "0.3"
+hex  = "0.4"
+
