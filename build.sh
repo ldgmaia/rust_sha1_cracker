@@ -5,13 +5,12 @@ set -e
 echo "=== 1/2  Compiling CUDA kernel to PTX ==="
 nvcc -ptx sha1_kernel.cu -o sha1_kernel.ptx -arch=sm_121 --use_fast_math -O3
 
-mkdir -p target/release
-cp sha1_kernel.ptx target/release/
-
 echo "=== 2/2  Building Rust binary ==="
 cargo build --release
 
+mkdir -p target/release
 cp sha1_kernel.ptx target/release/
+cp known_passwords.txt target/release/
 
 echo ""
 echo "=== Done — run with: ==="

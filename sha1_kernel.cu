@@ -39,12 +39,24 @@ __global__ void sha1_kernel(
 
         // ---------------------------------------------------------------- //
         // 1. Decode index → character array (most-significant first)
+        //
+        //    64-bit div/mod costs several times more than 32-bit on GPU ALUs.
+        //    idx needs the full 64 bits only for the first few digits; once
+        //    the remaining value fits in 32 bits, switch to native 32-bit
+        //    div/mod for the rest (e.g. the whole loop is 32-bit when
+        //    charset_len^pwd_len fits in 32 bits, as with digit-only charsets).
         // ---------------------------------------------------------------- //
-        uint64_t n = idx;
+        uint64_t n64 = idx;
         uint8_t  chars[16];
-        for (int j = pwd_len - 1; j >= 0; j--) {
-            chars[j] = s_charset[n % (uint32_t)charset_len];
-            n        /= (uint32_t)charset_len;
+        int j = pwd_len - 1;
+        for (; j >= 0 && n64 > 0xFFFFFFFFULL; j--) {
+            chars[j] = s_charset[(uint32_t)(n64 % (uint32_t)charset_len)];
+            n64 /= (uint32_t)charset_len;
+        }
+        uint32_t n32 = (uint32_t)n64;
+        for (; j >= 0; j--) {
+            chars[j] = s_charset[n32 % (uint32_t)charset_len];
+            n32      /= (uint32_t)charset_len;
         }
 
         // ---------------------------------------------------------------- //
@@ -140,4 +152,3 @@ __global__ void sha1_kernel(
 }
 
 } // extern "C"
-
