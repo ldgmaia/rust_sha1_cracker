@@ -34,6 +34,28 @@ This project brute-forces a SHA-1 hash using a CUDA kernel and a Rust host progr
 
   `./rust_sha1_cracker`
 
+## Command-Line Options
+
+All of the options below have defaults baked into [src/main.rs](src/main.rs) (edit and rebuild
+to change the defaults), but you can override them per run without rebuilding:
+
+| Flag | Short | Description | Example |
+|---|---|---|---|
+| `--hash` | `-H` | Target SHA-1 hash (40 hex chars, `sha1(utf16le($pass))`) | `--hash B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086` |
+| `--length-min` | | Minimum password length to try | `--length-min 6` |
+| `--length-max` | | Maximum password length to try | `--length-max 8` |
+| `--charset` | `-c` | Character set: `letters`, `numbers`, `alphanumeric`, `all` | `--charset alphanumeric` |
+
+Examples:
+
+- Try known Dell BIOS-style alphanumeric passwords, length 6-8:
+
+  `./rust_sha1_cracker --hash B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086 --charset alphanumeric --length-min 6 --length-max 8`
+
+- See all options:
+
+  `./rust_sha1_cracker --help`
+
 ## Run In Background With nohup
 
 Use this when you want the cracker to keep running after you close the terminal.
@@ -86,22 +108,68 @@ Use this when you want the cracker to keep running after you close the terminal.
 
 ## Configure What To Crack
 
-Edit [src/main.rs](src/main.rs) before building/running:
+Most options are now CLI flags (see [Command-Line Options](#command-line-options)) and do not
+require a rebuild: `--hash`, `--charset`, `--length-min`, `--length-max`.
 
-1. `TARGET_HASH`: SHA-1 hash to crack (40 hex chars)
-2. `CHARSET`: candidate characters
-3. `PWD_LEN_MIN` and `PWD_LEN_MAX`: password length range
+To change other defaults, edit [src/main.rs](src/main.rs) before building:
 
-Example:
-
-- Try only length 5:
-  - `PWD_LEN_MIN = 5`
-  - `PWD_LEN_MAX = 5`
-- Try 6 through 8:
-  - `PWD_LEN_MIN = 6`
-  - `PWD_LEN_MAX = 8`
+1. `TARGET_HASH`, `PWD_LEN_MIN`, `PWD_LEN_MAX`: default values used when the matching CLI flag is omitted
+2. `CharsetOption::chars()`: edit the character lists behind `letters` / `numbers` / `alphanumeric` / `all`
 
 After any config change, run `./build.sh` again.
+
+## GPU Occupancy And Launch Configuration
+
+The grid/block size is no longer hard-coded. At startup the program queries the GPU
+(`cuOccupancyMaxPotentialBlockSize` / `cuOccupancyMaxActiveBlocksPerMultiprocessor` via `cust`)
+and prints a line like:
+
+```
+[*] GPU occupancy: 20 SMs | 32 regs/thread | 4 active block(s)/SM (100% theoretical occupancy)
+```
+
+This adapts automatically to whatever GPU the binary runs on — no manual tuning needed when
+moving between machines. To independently verify/profile on the server:
+
+- Register usage per thread. Must compile to a cubin (`-cubin`), not `-ptx` — `-ptx` stops
+  nvcc at the `cicc` stage and never invokes `ptxas`, so `-Xptxas -v` prints nothing with it:
+
+  `nvcc -Xptxas -v -arch=sm_121 --use_fast_math -O3 -cubin sha1_kernel.cu -o /tmp/sha1_kernel.cubin`
+
+  Look for the `Used XX registers` line and `N bytes spill stores/loads` (spills should be 0).
+
+- GPU topology / SM count / compute capability:
+
+  `nvidia-smi --query-gpu=name,compute_cap,clocks.max.sm --format=csv`
+
+- Achieved occupancy and stall reasons while the binary is running (requires Nsight Compute,
+  install via CUDA toolkit or `sudo apt install nsight-compute` if packaged for your distro):
+
+  `sudo ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active ./rust_sha1_cracker --length-max 5`
+
+  (use a small `--length-max` here just to get one short profiling run instead of a multi-day one)
+
+- Live SM/memory utilization while a full run is in progress:
+
+  `nvidia-smi dmon -s u`
+
+  This streams one line per second and only produces meaningful numbers while
+  `rust_sha1_cracker` is actually running — start it in one terminal, then run `dmon` in a
+  second terminal alongside it. Columns to watch:
+
+  ```
+  # gpu    sm   mem   enc   dec  jpg   ofa
+  # Idx     %     %     %     %    %     %
+      0    99    46     -     -    -     -
+  ```
+
+  - `sm`: streaming multiprocessor utilization — should sit near 100 during a brute-force run;
+    if it's noticeably lower, the GPU is stalling (e.g. on memory or launch overhead) instead of
+    computing.
+  - `mem`: memory controller utilization — this kernel is compute-bound, so this can safely be
+    much lower than `sm`.
+  - Press `Ctrl+C` to stop it, or run `nvidia-smi dmon -s u -c 30` to auto-stop after 30 samples
+    instead of streaming indefinitely.
 
 ## Try Known Passwords First
 
