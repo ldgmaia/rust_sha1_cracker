@@ -5,18 +5,26 @@ use std::error::Error;
 use std::time::Instant;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs;
+use std::path::Path;
 
 // -----------------------------------------------------------------------
 // Configuration – change CHARSET and PWD_LEN_MIN/MAX to match your target
 // -----------------------------------------------------------------------
 const TARGET_HASH: &str = "B4CFC8DC918B7CBF9F7653B1DDB0540D7748C086";
 
+// Plain-text file, one candidate password per line. Lines starting with
+// '#' and empty lines are skipped. Checked on CPU before the GPU
+// brute-force search starts.
+const KNOWN_PASSWORDS_FILE: &str = "known_passwords.txt";
+
 // All printable ASCII: lowercase, uppercase, digits, symbols (95 chars)
 const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
 // const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+// const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 const PWD_LEN_MIN: usize = 1;
-const PWD_LEN_MAX: usize = 6;
+const PWD_LEN_MAX: usize = 8;
 
 // Tuning – GB10 Blackwell (32 regs/thread = 100% theoretical occupancy)
 // Grid: 512 blocks x 256 threads = 131 072 resident threads
@@ -25,6 +33,47 @@ const BLOCKS: u32            = 512;
 
 // How often the progress heartbeat prints while a length is running
 const PROGRESS_INTERVAL_SECS: u64 = 30;
+
+// -----------------------------------------------------------------------
+// Hash a candidate password the same way the target hash was produced:
+// SHA-1(UTF-16LE(password)) → 5 big-endian uint32 words
+// -----------------------------------------------------------------------
+fn hash_words(password: &str) -> [u32; 5] {
+    let utf16: Vec<u8> = password.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let digest = sha1_smol::Sha1::from(&utf16).digest().bytes();
+    let mut words = [0u32; 5];
+    for i in 0..5 {
+        words[i] = u32::from_be_bytes(digest[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    words
+}
+
+// -----------------------------------------------------------------------
+// Try a list of known/likely passwords on the CPU before touching the GPU.
+// Returns the matching password, if any.
+// -----------------------------------------------------------------------
+fn try_known_passwords(path: &str, target_u32: &[u32; 5]) -> Option<String> {
+    if !Path::new(path).exists() {
+        println!("[*] No known-password list found at '{}', skipping straight to brute force.", path);
+        return None;
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let candidates: Vec<&str> = contents
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    println!("[*] Trying {} known password(s) from '{}'...", candidates.len(), path);
+    for candidate in candidates {
+        if &hash_words(candidate) == target_u32 {
+            return Some(candidate.to_string());
+        }
+    }
+    println!("[!] No match in known-password list. Falling back to brute force.");
+    None
+}
 
 // -----------------------------------------------------------------------
 // Decode a base-N index back to a password string
@@ -54,6 +103,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         target_u32[i] = u32::from_be_bytes(
             target_raw[i*4..i*4+4].try_into().unwrap()
         );
+    }
+
+    // ------------------------------------------------------------------- //
+    // 1b. Try known/likely passwords first (fast, CPU-only, no GPU needed)
+    // ------------------------------------------------------------------- //
+    if let Some(password) = try_known_passwords(KNOWN_PASSWORDS_FILE, &target_u32) {
+        println!("\n[FOUND] Password: '{}' (from known-password list)", password);
+        return Ok(());
     }
 
     // ------------------------------------------------------------------- //

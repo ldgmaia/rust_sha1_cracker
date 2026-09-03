@@ -103,6 +103,19 @@ Example:
 
 After any config change, run `./build.sh` again.
 
+## Try Known Passwords First
+
+Before starting the GPU brute-force search, the program checks a plain-text
+wordlist on the CPU: [known_passwords.txt](known_passwords.txt).
+
+- One candidate password per line.
+- Lines starting with `#` and empty lines are ignored.
+- If a match is found, the program prints it and exits without touching the GPU.
+- If the file is missing or no match is found, it falls back to the normal brute-force search.
+
+Run the binary from the same directory as `known_passwords.txt` (e.g. `target/release`)
+so it can find the file, or copy it next to the binary like `sha1_kernel.ptx`.
+
 ## Verify Environment
 
 Useful checks:
